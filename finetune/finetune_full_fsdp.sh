@@ -1,5 +1,7 @@
 #!/bin/bash
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING=1
 DIR=`pwd`
 
 # Guide:
@@ -116,17 +118,17 @@ TRAINING_ARGS="
     --num_train_epochs 5 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 16 \
+    --gradient_accumulation_steps 32 \
     --learning_rate 1e-5 \
     --weight_decay 0.1 \
     --adam_beta2 0.95 \
     --warmup_ratio 0.01 \
     --lr_scheduler_type cosine \
-    --model_max_length 512 \
+    --model_max_length 256 \
     --gradient_checkpointing True \
     --lazy_preprocess True \
     --bf16 True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers 2 \
     --save_strategy steps \
     --save_steps 1000 \
     --save_total_limit 10 \
@@ -139,7 +141,10 @@ TRAINING_ARGS="
     --remove_unused_columns False \
     --ddp_find_unused_parameters False \
     --optim $OPTIMIZER \
-    --seed 42
+    --seed 42 \
+    --max_grad_norm 1.0 \
+    --dataloader_pin_memory False \
+    --dataloader_persistent_workers False
 "
 
 # Add optimizer-specific parameters

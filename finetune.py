@@ -228,51 +228,100 @@ def create_custom_optimizer(model, training_args):
 
 def create_muon_optimizer(model, training_args):
     """Create Muon optimizer"""
-    muon_params, adamw_params = [], []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            # Use Muon for 2D parameters that aren't embeddings or heads
-            if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
-                muon_params.append(param)
-            else:
-                adamw_params.append(param)
-
+    muon_params = get_muon_params(model)
+    adam_params_with_wd = get_adam_params_with_weight_decay(model, training_args.weight_decay)
+    adam_params_without_wd = get_adam_params_without_weight_decay(model)
+    
     # Get optimizer settings from training_args
     ns_steps = getattr(training_args, "muon_ns_steps", 5)
 
-    # Determine if we're in distributed mode
-    distributed = getattr(training_args, "local_rank", -1) != -1
-    overlap_comm = getattr(training_args, "overlap_comm", False)
-
-    optimizer = Muon(
-        lr=training_args.learning_rate,
-        wd=training_args.weight_decay,
-        muon_params=muon_params,
-        momentum=training_args.muon_momentum,
-        nesterov=training_args.muon_nesterov,
-        ns_steps=ns_steps,
-        adamw_params=adamw_params,
-        adamw_betas=(training_args.adam_beta1, training_args.adam_beta2),
-        adamw_eps=training_args.adam_epsilon,
-        distributed=distributed,
-        overlap_comm=overlap_comm,
-    )
-    rank0_print(f"Using Muon optimizer with {len(muon_params)} Muon params and {len(adamw_params)} AdamW params.")
+    param_groups = []
+    
+    # Add Muon parameter group
+    if muon_params:
+        param_groups.append({
+            "params": muon_params,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_muon": True,
+            "momentum": training_args.muon_momentum,
+            "nesterov": training_args.muon_nesterov,
+            "ns_steps": ns_steps,
+            "rms_scale": True,
+        })
+    
+    # 为 embedding/head 参数使用 AdamW 优化（使用 weight_decay）
+    if adam_params_with_wd:
+        param_groups.append({
+            "params": adam_params_with_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_muon": False,
+            "betas": (training_args.adam_beta1, training_args.adam_beta2),
+            "eps": training_args.adam_epsilon,
+        })
+    
+    # 为 norm/bias 参数使用 AdamW 优化（不使用 weight_decay）
+    if adam_params_without_wd:
+        param_groups.append({
+            "params": adam_params_without_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": 0.0,  # norm/bias 参数不使用 weight_decay
+            "use_muon": False,
+            "betas": (training_args.adam_beta1, training_args.adam_beta2),
+            "eps": training_args.adam_epsilon,
+        })
+    
+    optimizer = Muon(param_groups)
+    rank0_print(f"Using Muon optimizer with {len(muon_params)} Muon params, {len(adam_params_with_wd)} AdamW params (with wd), and {len(adam_params_without_wd)} AdamW params (without wd).")
     return optimizer
 
 
 def create_adamuon_optimizer(model, training_args):
     """Create AdamUon optimizer"""
-    optimizer = Adamuon(
-        named_params=model.named_parameters(),
-        lr=training_args.learning_rate,
-        weight_decay=training_args.weight_decay,
-        momentum=training_args.momentum,
-        nesterov=training_args.nesterov,
-        rank=os.environ.get("RANK", 0),
-        world_size=os.environ.get("WORLD_SIZE", 1),
-    )
-    rank0_print("Using AdamUon optimizer.")
+    muon_params = get_muon_params(model)
+    adam_params_with_wd = get_adam_params_with_weight_decay(model, training_args.weight_decay)
+    adam_params_without_wd = get_adam_params_without_weight_decay(model)
+    
+    param_groups = []
+    
+    # Add AdamUon parameter group for non-embedding/norm parameters
+    if muon_params:
+        param_groups.append({
+            "params": muon_params,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_adamuon": True,
+            "momentum": training_args.momentum,
+            "nesterov": training_args.nesterov,
+            "rank": int(os.environ.get("RANK", 0)),
+            "world_size": int(os.environ.get("WORLD_SIZE", 1)),
+        })
+    
+    # 为 embedding/head 参数使用 AdamW 优化（使用 weight_decay）
+    if adam_params_with_wd:
+        param_groups.append({
+            "params": adam_params_with_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_adamuon": False,
+            "betas": (training_args.adam_beta1, training_args.adam_beta2),
+            "eps": training_args.adam_epsilon,
+        })
+    
+    # 为 norm/bias 参数使用 AdamW 优化（不使用 weight_decay）
+    if adam_params_without_wd:
+        param_groups.append({
+            "params": adam_params_without_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": 0.0,  # norm/bias 参数不使用 weight_decay
+            "use_adamuon": False,
+            "betas": (training_args.adam_beta1, training_args.adam_beta2),
+            "eps": training_args.adam_epsilon,
+        })
+    
+    optimizer = Adamuon(param_groups)
+    rank0_print(f"Using AdamUon optimizer with {len(muon_params)} AdamUon params, {len(adam_params_with_wd)} AdamW params (with wd), and {len(adam_params_without_wd)} AdamW params (without wd).")
     return optimizer
 
 
