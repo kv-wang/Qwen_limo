@@ -82,7 +82,16 @@ if __name__ == "__main__":
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    tokenizer.pad_token_id = tokenizer.eod_id
+    # For Qwen2Tokenizer, use special_tokens to get endoftext token ID
+    if hasattr(tokenizer, 'special_tokens') and '<|endoftext|>' in tokenizer.special_tokens:
+        tokenizer.pad_token_id = tokenizer.special_tokens['<|endoftext|>']
+    else:
+        # Fallback: try to get eod_id if it exists, otherwise use a default
+        if hasattr(tokenizer, 'eod_id'):
+            tokenizer.pad_token_id = tokenizer.eod_id
+        else:
+            # Use the last token in vocab as pad token
+            tokenizer.pad_token_id = len(tokenizer) - 1
     data = preprocess(json.load(open(args.data_path)), tokenizer, args.max_len)
 
     model = AutoGPTQForCausalLM.from_pretrained(args.model_name_or_path, quantize_config, device_map="auto", trust_remote_code=True)

@@ -17,6 +17,25 @@ from transformers.trainer_pt_utils import LabelSmoother
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from accelerate.utils import DistributedType
 
+# Import custom optimizers
+try:
+    from muon import Muon
+    MUON_AVAILABLE = True
+except ImportError:
+    MUON_AVAILABLE = False
+
+try:
+    from adamuon import Adamuon
+    ADAMUON_AVAILABLE = True
+except ImportError:
+    ADAMUON_AVAILABLE = False
+
+try:
+    from limo import LiMo
+    LIMO_AVAILABLE = True
+except ImportError:
+    LIMO_AVAILABLE = False
+
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
@@ -48,6 +67,33 @@ class TrainingArguments(transformers.TrainingArguments):
         },
     )
     use_lora: bool = False
+    
+    # Custom optimizer parameters
+    use_muon: bool = field(default=False, metadata={"help": "Use Muon optimizer"})
+    use_adamuon: bool = field(default=False, metadata={"help": "Use AdamUon optimizer"})
+    use_limo: bool = field(default=False, metadata={"help": "Use LiMo optimizer"})
+    
+    # Muon specific parameters
+    muon_momentum: float = field(default=0.95, metadata={"help": "Momentum for Muon optimizer"})
+    muon_nesterov: bool = field(default=True, metadata={"help": "Use Nesterov momentum for Muon"})
+    muon_ns_steps: int = field(default=5, metadata={"help": "Number of steps for Muon"})
+    
+    # AdamUon specific parameters
+    momentum: float = field(default=0.95, metadata={"help": "Momentum for AdamUon optimizer"})
+    nesterov: bool = field(default=False, metadata={"help": "Use Nesterov momentum for AdamUon"})
+    
+    # LiMo specific parameters
+    limo_momentum: float = field(default=0.95, metadata={"help": "Momentum for LiMo optimizer"})
+    limo_momentum_2: float = field(default=0.98, metadata={"help": "Second momentum for LiMo optimizer"})
+    limo_ns_steps: int = field(default=5, metadata={"help": "Number of steps for LiMo"})
+    limo_rms_scale: bool = field(default=True, metadata={"help": "Use RMS scaling for LiMo"})
+    limo_use_scale: bool = field(default=True, metadata={"help": "Use scale for LiMo"})
+    
+    def __post_init__(self):
+        # 如果有自定义优化器，使用 adamw_torch 作为默认值来绕过 Transformers 的验证
+        if self.use_muon or self.use_adamuon or self.use_limo:
+            self.optim = "adamw_torch"
+        super().__post_init__()
 
 
 @dataclass
@@ -104,6 +150,180 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def get_muon_params(model):
+    """Get parameters that should use Muon optimization (non-embedding/norm parameters)"""
+    muon_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        param_name = name.lower()
+        # 判断是否为 embedding/norm 参数
+        is_embln = any(
+            key in param_name
+            for key in [
+                "wte", "wpe", "embd", "embed", "bias",
+                "ln", "norm", "lm_head",
+                "output", "final_layer"
+            ]
+        )
+        # 非 embedding/norm 参数使用 Muon 优化
+        if not is_embln:
+            muon_params.append(param)
+    return muon_params
+
+
+def get_adam_params_with_weight_decay(model, weight_decay):
+    """Get parameters that should use Adam optimization with weight_decay (embedding/head parameters)"""
+    adam_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        param_name = name.lower()
+        # 判断是否为 embedding/head 参数（非 norm/bias）
+        is_embln = any(
+            key in param_name
+            for key in [
+                "wte", "wpe", "embd", "embed",
+                "lm_head", "output", "final_layer"
+            ]
+        )
+        # 排除 norm/bias 参数
+        is_norm_bias = any(keyword in param_name for keyword in ("norm", "ln", "bias"))
+        
+        # embedding/head 参数使用 Adam 优化，且使用 weight_decay
+        if is_embln and not is_norm_bias:
+            adam_params.append(param)
+    return adam_params
+
+
+def get_adam_params_without_weight_decay(model):
+    """Get parameters that should use Adam optimization without weight_decay (norm/bias parameters)"""
+    adam_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        param_name = name.lower()
+        # 判断是否为 norm/bias 参数
+        is_norm_bias = any(keyword in param_name for keyword in ("norm", "ln", "bias"))
+        
+        # norm/bias 参数使用 Adam 优化，但不使用 weight_decay
+        if is_norm_bias:
+            adam_params.append(param)
+    return adam_params
+
+
+def create_custom_optimizer(model, training_args):
+    """Create custom optimizer based on training arguments"""
+    if training_args.use_muon and MUON_AVAILABLE:
+        return create_muon_optimizer(model, training_args)
+    elif training_args.use_adamuon and ADAMUON_AVAILABLE:
+        return create_adamuon_optimizer(model, training_args)
+    elif training_args.use_limo and LIMO_AVAILABLE:
+        return create_limo_optimizer(model, training_args)
+    else:
+        return None
+
+
+def create_muon_optimizer(model, training_args):
+    """Create Muon optimizer"""
+    muon_params, adamw_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # Use Muon for 2D parameters that aren't embeddings or heads
+            if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+    # Get optimizer settings from training_args
+    ns_steps = getattr(training_args, "muon_ns_steps", 5)
+
+    # Determine if we're in distributed mode
+    distributed = getattr(training_args, "local_rank", -1) != -1
+    overlap_comm = getattr(training_args, "overlap_comm", False)
+
+    optimizer = Muon(
+        lr=training_args.learning_rate,
+        wd=training_args.weight_decay,
+        muon_params=muon_params,
+        momentum=training_args.muon_momentum,
+        nesterov=training_args.muon_nesterov,
+        ns_steps=ns_steps,
+        adamw_params=adamw_params,
+        adamw_betas=(training_args.adam_beta1, training_args.adam_beta2),
+        adamw_eps=training_args.adam_epsilon,
+        distributed=distributed,
+        overlap_comm=overlap_comm,
+    )
+    rank0_print(f"Using Muon optimizer with {len(muon_params)} Muon params and {len(adamw_params)} AdamW params.")
+    return optimizer
+
+
+def create_adamuon_optimizer(model, training_args):
+    """Create AdamUon optimizer"""
+    optimizer = Adamuon(
+        named_params=model.named_parameters(),
+        lr=training_args.learning_rate,
+        weight_decay=training_args.weight_decay,
+        momentum=training_args.momentum,
+        nesterov=training_args.nesterov,
+        rank=os.environ.get("RANK", 0),
+        world_size=os.environ.get("WORLD_SIZE", 1),
+    )
+    rank0_print("Using AdamUon optimizer.")
+    return optimizer
+
+
+def create_limo_optimizer(model, training_args):
+    """Create LiMo optimizer"""
+    muon_params = get_muon_params(model)
+    adam_params_with_wd = get_adam_params_with_weight_decay(model, training_args.weight_decay)
+    adam_params_without_wd = get_adam_params_without_weight_decay(model)
+    
+    param_groups = []
+    
+    if muon_params:
+        param_groups.append({
+            "params": muon_params,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_limo": True,
+            "momentum": training_args.limo_momentum,
+            "momentum_2": training_args.limo_momentum_2,
+            "rms_scale": training_args.limo_rms_scale,
+            "nesterov": True,
+            "ns_steps": training_args.limo_ns_steps,
+            "eps": 1e-8,
+            "use_scale": training_args.limo_use_scale
+        })
+    
+    # 为 embedding/head 参数使用 Adam 优化（使用 weight_decay）
+    if adam_params_with_wd:
+        param_groups.append({
+            "params": adam_params_with_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": training_args.weight_decay,
+            "use_limo": False,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8
+        })
+    
+    # 为 norm/bias 参数使用 Adam 优化（不使用 weight_decay）
+    if adam_params_without_wd:
+        param_groups.append({
+            "params": adam_params_without_wd,
+            "lr": training_args.learning_rate,
+            "weight_decay": 0.0,  # norm/bias 参数不使用 weight_decay
+            "use_limo": False,
+            "betas": (0.9, 0.95),
+            "eps": 1e-8
+        })
+    
+    optimizer = LiMo(param_groups)
+    rank0_print("Using LiMo optimizer.")
+    return optimizer
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str, bias="none"):
@@ -325,7 +545,16 @@ def train():
         use_fast=False,
         trust_remote_code=True,
     )
-    tokenizer.pad_token_id = tokenizer.eod_id
+    # For Qwen2Tokenizer, use special_tokens to get endoftext token ID
+    if hasattr(tokenizer, 'special_tokens') and '<|endoftext|>' in tokenizer.special_tokens:
+        tokenizer.pad_token_id = tokenizer.special_tokens['<|endoftext|>']
+    else:
+        # Fallback: try to get eod_id if it exists, otherwise use a default
+        if hasattr(tokenizer, 'eod_id'):
+            tokenizer.pad_token_id = tokenizer.eod_id
+        else:
+            # Use the last token in vocab as pad token
+            tokenizer.pad_token_id = len(tokenizer) - 1
 
     if training_args.use_lora:
         if lora_args.q_lora or is_chat_model:
@@ -359,10 +588,18 @@ def train():
         tokenizer=tokenizer, data_args=data_args, max_len=training_args.model_max_length
     )
 
+    # Create custom optimizer if specified
+    custom_optimizer = create_custom_optimizer(model, training_args)
+    
     # Start trainner
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
+    
+    # Set custom optimizer if available
+    if custom_optimizer is not None:
+        trainer.optimizer = custom_optimizer
+        rank0_print(f"Using custom optimizer: {type(custom_optimizer).__name__}")
 
     trainer.train()
     trainer.save_state()

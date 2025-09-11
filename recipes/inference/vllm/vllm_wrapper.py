@@ -22,7 +22,14 @@ BatchTokensType = List[List[int]]
 
 def get_stop_words_ids(chat_format, tokenizer):
     if chat_format == "raw":
-        stop_words_ids = [tokenizer.encode("Human:"), [tokenizer.eod_id]]
+        # For Qwen2Tokenizer, use special_tokens to get endoftext token ID
+        if hasattr(tokenizer, 'special_tokens') and '<|endoftext|>' in tokenizer.special_tokens:
+            eod_id = tokenizer.special_tokens['<|endoftext|>']
+        elif hasattr(tokenizer, 'eod_id'):
+            eod_id = tokenizer.eod_id
+        else:
+            eod_id = len(tokenizer) - 1  # fallback
+        stop_words_ids = [tokenizer.encode("Human:"), [eod_id]]
     elif chat_format == "chatml":
         stop_words_ids = [[tokenizer.im_end_id], [tokenizer.im_start_id]]
     else:
