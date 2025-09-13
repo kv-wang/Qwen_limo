@@ -1,4 +1,6 @@
 #!/bin/bash
+
+export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_LAUNCH_BLOCKING=1
@@ -25,7 +27,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 # The port for communication
 MASTER_PORT=${MASTER_PORT:-6001}
 
-MODEL="/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796" # Set the path if you do not want to load from huggingface directly
+MODEL="Qwen/Qwen2.5-7B" # Set the path if you do not want to load from huggingface directly
 # ATTENTION: specify the path to your training data, which should be a json file consisting of a list of conversations.
 # See the section for finetuning in README for more information.
 DATA="tulu_conversations.json"
@@ -124,7 +126,7 @@ TRAINING_ARGS="
     --adam_beta2 0.95 \
     --warmup_ratio 0.01 \
     --lr_scheduler_type cosine \
-    --model_max_length 256 \
+    --model_max_length 2500 \
     --gradient_checkpointing True \
     --lazy_preprocess True \
     --bf16 True \

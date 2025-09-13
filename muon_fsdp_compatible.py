@@ -1,8 +1,5 @@
-# ruff: noqa
-# type: ignore
-# fmt: off
-
-# credits to https://gist.github.com/main-horse/7314170780e36f7443d1926418d75823
+# 这是一个 FSDP 兼容的 Muon 优化器版本
+# 可以直接替换 muon.py 使用
 
 import math
 from typing import Protocol
@@ -14,8 +11,6 @@ from collections import deque
 __version__ = "0.3.0"
 
 __all__ = ["Muon"]
-
-
 
 @torch.compile(fullgraph=True)
 def nsloop_torch(X: torch.Tensor, steps: int, *, a=3.4445, b=-4.7750, c=2.0315):
@@ -82,8 +77,6 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
     buf2c = buf2 / (1 - betas[1]**step)
     return buf1c / (buf2c.sqrt() + eps)
 
-
-
 class Work(Protocol):
     
     def __init__(self, param, state, group, index: int):
@@ -94,7 +87,6 @@ class Work(Protocol):
     
     def finish(self):
         ...
-    
     
 class Fsdp1dWork:
     """
@@ -160,7 +152,6 @@ class Fsdp1dWork:
         self.param.mul_(1 - self.group["lr"] * self.group["weight_decay"])
         self.param.add_(update.reshape(self.param.shape), alpha=-self.group["lr"])
 
-
 class TpFsdp2dWork:
     """
     Muon work for TP + FSDP mesh
@@ -202,51 +193,122 @@ class SingelDeviceWork:
         
     def finish(self):
         pass
-    
-    
+
+def muon_update(grad, momentum_buffer, momentum, nesterov, ns_steps, rms_scale):
+    """Muon update step"""
+    update = apply_momentum(grad, momentum_buffer, momentum, nesterov)
+    update = zeropower_via_newtonschulz5(update, ns_steps)
+    update = apply_scaling(update, rms_scale)
+    return update
+
 class Muon(torch.optim.Optimizer):
     """
-    DTensor variant of Muon, original code https://github.com/KellerJordan/Muon/blob/f90a42b28e00b8d9d2d05865fe90d9f39abcbcbd/muon.py
-    also support single device variant.
-    
-    Notable changes:
-        - add rms_scale argument to the optimizer following the moonlight paper https://arxiv.org/abs/2502.16982
-    
-    example usage:
-    
-    ```python
-    
-    from muon_fsdp2 import Muon
-
-
-    optimizer = Muon([
-        dict(
-            params=model.square_params(),
-            lr=1e-3,
-            use_muon=True
-        ),
-        dict(
-            params=model.non_square_params(),
-            lr=1e-3,
-            use_muon=False
-        )
-    ])   
-    ```
-    
-    
-    param_groups args:
-        lr: learning rate
-        momentum: momentum
-        weight_decay: weight decay
-        use_muon: whether to use muon
-        rms_scale: whether to scale the gradient by the RMS of the gradient . If true use the rms scale from the moonlight paper.
-                https://github.com/MoonshotAI/Moonlight/blob/5afcb6911077e7f182d1d7faa3c2cd45acba4666/examples/toy_train.py#L146
-                This variant adjust the update so that the RMS match the one of adam, allowing to only have one learning rate for all parameters.
-
+    FSDP-compatible Muon optimizer that can handle both param_groups and model.parameters() calls.
     """
-    def __init__(self, param_groups):
-        for group in param_groups:
+    
+    def __init__(self, params, defaults=None, **kwargs):
+        # 处理不同的输入格式
+        if isinstance(params, list) and len(params) > 0 and isinstance(params[0], dict):
+            # 情况1：传入的是参数组列表 (param_groups)
+            param_groups = params
+        else:
+            # 情况2：传入的是 model.parameters() 生成器
+            # 转换为参数列表
+            if not isinstance(params, list):
+                params = list(params)
             
+            # 在 Muon 内部进行参数分组
+            muon_params = []
+            adam_params_with_wd = []
+            adam_params_without_wd = []
+            
+            for param in params:
+                if not param.requires_grad:
+                    continue
+                    
+                # 获取参数名称
+                param_name = getattr(param, 'name', 'unknown')
+                param_name_lower = param_name.lower()
+                
+                # 判断是否为 embedding/head 参数（非 norm/bias）
+                is_embln = any(
+                    key in param_name_lower
+                    for key in [
+                        "wte", "wpe", "embd", "embed",
+                        "lm_head", "output", "final_layer"
+                    ]
+                )
+                
+                # 判断是否为 norm/bias 参数
+                is_norm_bias = any(keyword in param_name_lower for keyword in ("norm", "ln", "bias"))
+                
+                # 判断是否为非 embedding/norm 参数（使用 Muon）
+                is_muon_param = not any(
+                    key in param_name_lower
+                    for key in [
+                        "wte", "wpe", "embd", "embed", "bias",
+                        "ln", "norm", "lm_head",
+                        "output", "final_layer"
+                    ]
+                )
+                
+                if is_muon_param:
+                    muon_params.append(param)
+                elif is_embln and not is_norm_bias:
+                    adam_params_with_wd.append(param)
+                elif is_norm_bias:
+                    adam_params_without_wd.append(param)
+            
+            # 构建参数组
+            param_groups = []
+            
+            # 从 defaults 或 kwargs 中获取配置
+            lr = defaults.get('lr', 0.02) if defaults else 0.02
+            weight_decay = defaults.get('weight_decay', 0.1) if defaults else 0.1
+            momentum = defaults.get('momentum', 0.95) if defaults else 0.95
+            nesterov = defaults.get('nesterov', True) if defaults else True
+            ns_steps = defaults.get('ns_steps', 5) if defaults else 5
+            rms_scale = defaults.get('rms_scale', True) if defaults else True
+            betas = defaults.get('betas', (0.9, 0.95)) if defaults else (0.9, 0.95)
+            eps = defaults.get('eps', 1e-10) if defaults else 1e-10
+            
+            # 添加 Muon 参数组
+            if muon_params:
+                param_groups.append({
+                    "params": muon_params,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "use_muon": True,
+                    "momentum": momentum,
+                    "nesterov": nesterov,
+                    "ns_steps": ns_steps,
+                    "rms_scale": rms_scale,
+                })
+            
+            # 为 embedding/head 参数使用 AdamW 优化（使用 weight_decay）
+            if adam_params_with_wd:
+                param_groups.append({
+                    "params": adam_params_with_wd,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "use_muon": False,
+                    "betas": betas,
+                    "eps": eps,
+                })
+            
+            # 为 norm/bias 参数使用 AdamW 优化（不使用 weight_decay）
+            if adam_params_without_wd:
+                param_groups.append({
+                    "params": adam_params_without_wd,
+                    "lr": lr,
+                    "weight_decay": 0.0,  # norm/bias 参数不使用 weight_decay
+                    "use_muon": False,
+                    "betas": betas,
+                    "eps": eps,
+                })
+        
+        # 处理参数组
+        for group in param_groups:
             if group["use_muon"]:
                 # defaults
                 group["lr"] = group.get("lr", 0.02)
@@ -255,20 +317,16 @@ class Muon(torch.optim.Optimizer):
                 group["rms_scale"] = group.get("rms_scale", True)
                 group["nesterov"] = group.get("nesterov", True)
                 group["ns_steps"] = group.get("ns_steps", 5)
-                
-                #assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon", "rms_scale", "nesterov", "ns_steps"])
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon", "rms_scale", "nesterov", "ns_steps"])
             else:
                 # defaults
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0)
-   
-                #assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
-        super().__init__(param_groups, dict()) # torch.optim.Optimizer.__init__ 父类初始化，传入空字典
-        # 等价于：
-        # self.param_groups = param_groups
-        # self.defaults = dict()
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        
+        super().__init__(param_groups, defaults or dict())
 
     def _get_work_class(self, p: torch.Tensor) -> tuple[type[Work], int]:
         """
@@ -335,7 +393,4 @@ class Muon(torch.optim.Optimizer):
             work.finish()
             
         return loss
-    
 
-
-    

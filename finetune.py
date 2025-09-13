@@ -272,7 +272,10 @@ def create_muon_optimizer(model, training_args):
             "eps": training_args.adam_epsilon,
         })
     
+    
+    
     optimizer = Muon(param_groups)
+    
     rank0_print(f"Using Muon optimizer with {len(muon_params)} Muon params, {len(adam_params_with_wd)} AdamW params (with wd), and {len(adam_params_without_wd)} AdamW params (without wd).")
     return optimizer
 
@@ -397,10 +400,36 @@ def preprocess(
     max_len: int,
     system_message: str = "You are a helpful assistant."
 ) -> Dict:
+    # 过滤掉过长的序列
+    filtered_sources = []
+    for source in sources:
+        # 估算序列长度
+        total_length = 0
+        for sentence in source:
+            if isinstance(sentence, dict) and "value" in sentence:
+                total_length += len(tokenizer.encode(sentence["value"], add_special_tokens=False))
+        # 如果序列太长，跳过这个样本
+        if total_length > max_len * 0.8:  # 留一些余量给特殊token
+            continue
+        filtered_sources.append(source)
+    
+    if not filtered_sources:
+        # 如果没有合适的样本，返回一个空样本
+        return {
+            "input_ids": torch.tensor([[tokenizer.pad_token_id] * max_len], dtype=torch.int),
+            "labels": torch.tensor([[IGNORE_TOKEN_ID] * max_len], dtype=torch.int),
+            "attention_mask": torch.tensor([[False] * max_len], dtype=torch.bool),
+        }
+    
+    sources = filtered_sources
     roles = {"user": "<|im_start|>user", "assistant": "<|im_start|>assistant"}
 
-    im_start = tokenizer.im_start_id
-    im_end = tokenizer.im_end_id
+    #im_start = tokenizer.im_start_id
+    #im_end = tokenizer.im_end_id
+    im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    # modified to support Qwen2Tokenizer
+    
     nl_tokens = tokenizer('\n').input_ids
     _system = tokenizer('system').input_ids + nl_tokens
     _user = tokenizer('user').input_ids + nl_tokens
@@ -595,6 +624,7 @@ def train():
         trust_remote_code=True,
     )
     # For Qwen2Tokenizer, use special_tokens to get endoftext token ID
+    '''
     if hasattr(tokenizer, 'special_tokens') and '<|endoftext|>' in tokenizer.special_tokens:
         tokenizer.pad_token_id = tokenizer.special_tokens['<|endoftext|>']
     else:
@@ -604,7 +634,11 @@ def train():
         else:
             # Use the last token in vocab as pad token
             tokenizer.pad_token_id = len(tokenizer) - 1
-
+    '''
+    #tokenizer.pad_token_id = tokenizer.eod_id
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    # modified to support Qwen2Tokenizer
+    
     if training_args.use_lora:
         if lora_args.q_lora or is_chat_model:
             modules_to_save = None
@@ -636,6 +670,8 @@ def train():
     data_module = make_supervised_data_module(
         tokenizer=tokenizer, data_args=data_args, max_len=training_args.model_max_length
     )
+    
+    
 
     # Create custom optimizer if specified
     custom_optimizer = create_custom_optimizer(model, training_args)
